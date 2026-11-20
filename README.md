@@ -16,6 +16,8 @@ those explicitly with tested rules.
 - Sites, gateways/devices and measurement tags
 - High/low limits per tag, with unit metadata
 - Idempotent ingestion keyed by device + tag + timestamp
+- Offline batch reconciliation with batch-level idempotency (`POST /devices/{device_id}/batches`)
+- Missing telemetry sampling gap detection (`GET /tags/{tag_key}/gaps`)
 - Duplicate readings counted, not double-stored
 - Automatic high/low alarms and automatic clearing when values return to range
 - No duplicate active alarm per tag

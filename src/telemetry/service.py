@@ -118,6 +118,37 @@ class TelemetryService:
         self.session.commit()
         return {"inserted": inserted, "duplicates": duplicates, "alarms": alarms}
 
+    def ingest_batch(self, device_id: str, batch_id: str, readings: list[dict], client_sent_at: datetime | None = None) -> dict:
+        batch_id = (batch_id or "").strip()
+        if not batch_id:
+            raise ValidationError("batch_id is required")
+        batch_ref = f"{device_id}:{batch_id}"
+        prior = self.session.scalar(select(AuditRow).where(AuditRow.action == "batch_ingested", AuditRow.reference == batch_ref))
+        if prior is not None:
+            return {
+                "batch_id": batch_id,
+                "status": "already_processed",
+                "detail": prior.detail,
+                "idempotent": True,
+            }
+        drift_note = ""
+        if client_sent_at is not None:
+            delta = abs((utcnow() - as_utc(client_sent_at)).total_seconds())
+            if delta > 300:
+                drift_note = f" clock_drift_sec={round(delta, 1)}"
+        ingest_res = self.ingest(device_id, readings)
+        detail = f"inserted={ingest_res['inserted']} duplicates={ingest_res['duplicates']}{drift_note}"
+        self._audit("batch_ingested", batch_ref, detail)
+        self.session.commit()
+        return {
+            "batch_id": batch_id,
+            "status": "processed",
+            "inserted": ingest_res["inserted"],
+            "duplicates": ingest_res["duplicates"],
+            "alarms": ingest_res["alarms"],
+            "idempotent": False,
+        }
+
     def _evaluate(self, tag: TagRow, value: float, ts: datetime) -> dict | None:
         breach = None
         if tag.high_limit is not None and value > tag.high_limit:
@@ -165,6 +196,33 @@ class TelemetryService:
         if not count:
             raise NotFoundError("no readings for tag")
         return {"tag_key": tag_key, "count": count, "min": minimum, "max": maximum, "avg": round(average, 4)}
+
+    def detect_gaps(self, tag_key: str, expected_interval_seconds: int, since: datetime | None = None, until: datetime | None = None, tolerance_ratio: float = 1.5) -> list[dict]:
+        if expected_interval_seconds <= 0:
+            raise ValidationError("expected_interval_seconds must be positive")
+        query = select(ReadingRow).where(ReadingRow.tag_key == tag_key)
+        if since:
+            query = query.where(ReadingRow.ts >= as_utc(since))
+        if until:
+            query = query.where(ReadingRow.ts <= as_utc(until))
+        rows = self.session.scalars(query.order_by(ReadingRow.ts)).all()
+        if len(rows) < 2:
+            return []
+        threshold = expected_interval_seconds * tolerance_ratio
+        gaps = []
+        for i in range(1, len(rows)):
+            prev_ts = as_utc(rows[i - 1].ts)
+            curr_ts = as_utc(rows[i].ts)
+            delta_sec = (curr_ts - prev_ts).total_seconds()
+            if delta_sec > threshold:
+                est_missing = max(1, int(delta_sec // expected_interval_seconds) - 1)
+                gaps.append({
+                    "from_ts": prev_ts.isoformat(),
+                    "to_ts": curr_ts.isoformat(),
+                    "gap_seconds": round(delta_sec, 2),
+                    "estimated_missing": est_missing,
+                })
+        return gaps
 
     def acknowledge(self, alarm_id: int, note: str = "") -> AlarmRow:
         alarm = self.session.get(AlarmRow, alarm_id)
