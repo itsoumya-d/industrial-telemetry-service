@@ -189,3 +189,81 @@ def test_api_auth_and_workflow(client):
     assert latest["value"] == 35
     summary = client.get("/tags/temp/summary", headers={"X-API-Key": "viewer-key"}).json()
     assert summary["count"] == 1
+
+
+def test_ingest_batch_first_time(session):
+    service = TelemetryService(session)
+    seed(service)
+    batch_res = service.ingest_batch("DEV-1", "BATCH-001", [reading(21, 0), reading(22, 1)], client_sent_at=T0)
+    assert batch_res["batch_id"] == "BATCH-001"
+    assert batch_res["status"] == "processed"
+    assert batch_res["inserted"] == 2
+    assert batch_res["idempotent"] is False
+
+
+def test_ingest_batch_idempotent_retry(session):
+    service = TelemetryService(session)
+    seed(service)
+    service.ingest_batch("DEV-1", "BATCH-002", [reading(25, 0)])
+    # Retry same batch
+    retry_res = service.ingest_batch("DEV-1", "BATCH-002", [reading(25, 0)])
+    assert retry_res["batch_id"] == "BATCH-002"
+    assert retry_res["status"] == "already_processed"
+    assert retry_res["idempotent"] is True
+
+
+def test_ingest_batch_empty_id_rejected(session):
+    service = TelemetryService(session)
+    seed(service)
+    with pytest.raises(ValidationError):
+        service.ingest_batch("DEV-1", "   ", [reading(20)])
+
+
+def test_detect_gaps_none_when_continuous(session):
+    service = TelemetryService(session)
+    seed(service)
+    # Continuous readings every 60 seconds
+    service.ingest("DEV-1", [reading(20, 0), reading(21, 1), reading(22, 2)])
+    gaps = service.detect_gaps("temp", expected_interval_seconds=60)
+    assert gaps == []
+
+
+def test_detect_gaps_identifies_missing_interval(session):
+    service = TelemetryService(session)
+    seed(service)
+    # Readings at T0 and T0 + 10 minutes (gap of 600s with expected interval 60s)
+    service.ingest("DEV-1", [reading(20, 0), reading(22, 10)])
+    gaps = service.detect_gaps("temp", expected_interval_seconds=60)
+    assert len(gaps) == 1
+    assert gaps[0]["gap_seconds"] == 600.0
+    assert gaps[0]["estimated_missing"] == 9
+
+
+def test_api_batch_and_gap_endpoints(client):
+    headers = {"X-API-Key": "operator-key"}
+    site = client.post("/sites", json={"code": "SITE-B", "name": "Pasture"}, headers=headers).json()
+    client.post("/devices", json={"device_id": "DEV-B", "site_id": site["id"]}, headers=headers)
+    client.post("/tags", json={"site_id": site["id"], "tag_key": "vibe", "name": "Vibration"}, headers=headers)
+
+    payload = {
+        "batch_id": "BATCH-API-1",
+        "readings": [
+            {"tag_key": "vibe", "value": 1.2, "ts": T0.isoformat()},
+            {"tag_key": "vibe", "value": 1.8, "ts": (T0 + timedelta(minutes=5)).isoformat()}
+        ],
+        "client_sent_at": T0.isoformat()
+    }
+    res = client.post("/devices/DEV-B/batches", json=payload, headers=headers).json()
+    assert res["status"] == "processed"
+    assert res["inserted"] == 2
+
+    # Verify idempotency over API
+    res_retry = client.post("/devices/DEV-B/batches", json=payload, headers=headers).json()
+    assert res_retry["status"] == "already_processed"
+    assert res_retry["idempotent"] is True
+
+    # Test gaps API endpoint
+    gap_res = client.get("/tags/vibe/gaps?expected_interval_seconds=60", headers={"X-API-Key": "viewer-key"}).json()
+    assert gap_res["tag_key"] == "vibe"
+    assert len(gap_res["gaps"]) == 1
+    assert gap_res["gaps"][0]["gap_seconds"] == 300.0

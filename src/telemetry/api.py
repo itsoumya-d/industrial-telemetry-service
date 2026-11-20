@@ -44,6 +44,12 @@ class IngestIn(BaseModel):
     readings: list[ReadingIn]
 
 
+class BatchIngestIn(BaseModel):
+    batch_id: str
+    readings: list[ReadingIn]
+    client_sent_at: datetime | None = None
+
+
 class AlarmNoteIn(BaseModel):
     note: str = ""
 
@@ -106,10 +112,24 @@ def create_app(session_factory: sessionmaker = SessionLocal, api_keys: dict[str,
         except (NotFoundError, ConflictError, ValidationError) as exc:
             handle(exc)
 
+    @app.post("/devices/{device_id}/batches")
+    def batch(device_id: str, payload: BatchIngestIn, session: Session = Depends(db_session), actor: str = Depends(operator)) -> dict[str, Any]:
+        try:
+            return TelemetryService(session, actor).ingest_batch(device_id, payload.batch_id, [r.model_dump() for r in payload.readings], payload.client_sent_at)
+        except (NotFoundError, ConflictError, ValidationError) as exc:
+            handle(exc)
+
     @app.get("/tags/{tag_key}/latest")
     def latest(tag_key: str, session: Session = Depends(db_session), _: str = Depends(viewer)) -> dict[str, Any]:
         try:
             return TelemetryService(session).latest(tag_key)
+        except (NotFoundError, ConflictError, ValidationError) as exc:
+            handle(exc)
+
+    @app.get("/tags/{tag_key}/gaps")
+    def gaps(tag_key: str, expected_interval_seconds: int = 60, since: datetime | None = None, until: datetime | None = None, session: Session = Depends(db_session), _: str = Depends(viewer)) -> dict[str, Any]:
+        try:
+            return {"tag_key": tag_key, "gaps": TelemetryService(session).detect_gaps(tag_key, expected_interval_seconds, since, until)}
         except (NotFoundError, ConflictError, ValidationError) as exc:
             handle(exc)
 
