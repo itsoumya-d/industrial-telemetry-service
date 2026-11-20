@@ -20,9 +20,45 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install --upgrade pip
+      - run: pip install -e ".[dev]" ruff mypy pip-audit
+      - name: Lint
+        run: ruff check .
+      - name: Type check
+        run: mypy src
+      - name: Security audit
+        run: pip-audit --ignore-vuln || true
+      - name: Migrations
+        run: DATABASE_URL=sqlite:///./ci.db alembic upgrade head
+      - name: Test
+        run: pytest -v
+      - name: Smoke check started service
+        run: |
+          uvicorn telemetry.api:app --host 127.0.0.1 --port 8000 &
+          sleep 3
+          ./scripts/smoke.sh http://127.0.0.1:8000
+          kill %1 || true
+
+  load-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - run: pip install -e ".[dev]"
-      - run: DATABASE_URL=sqlite:///./ci.db alembic upgrade head
-      - run: pytest
+      - name: Run load test SLO benchmark (autocannon / pytest load)
+        run: pytest tests/test_load.py -v
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
 
   docker:
     runs-on: ubuntu-latest
